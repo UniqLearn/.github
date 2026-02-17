@@ -41,7 +41,7 @@ jobs:
       - name: Dispatch for specific issue (manual trigger)
         if: inputs.issue_number != ''
         env:
-          GH_TOKEN: ${{ secrets.PLANNING_GATE_TOKEN }}
+          GH_TOKEN: ${{ secrets.PLANNING_GATE_TOKEN_ORG }}
         run: |
           ISSUE_NUM="${{ inputs.issue_number }}"
           echo "Manual dispatch for issue #$ISSUE_NUM"
@@ -54,7 +54,7 @@ jobs:
       - name: Scan project board for Planning items
         if: inputs.issue_number == ''
         env:
-          GH_TOKEN: ${{ secrets.PLANNING_GATE_TOKEN }}
+          GH_TOKEN: ${{ secrets.PLANNING_GATE_TOKEN_ORG }}
         run: |
           echo "Scanning project board for Feature issues in Planning status..."
 
