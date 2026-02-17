@@ -1,0 +1,107 @@
+# ============================================================================
+# Planning Gate Dispatcher — Org-level workflow
+#
+# Listens to projects_v2_item events (project board status changes).
+# When a Feature issue moves to "Planning" status, dispatches the
+# planning-gate workflow in the Platform repo.
+#
+# TRIGGER: projects_v2_item edited (field value change)
+# CONDITION: Issue type = "Feature" AND new Status = "Planning"
+# ACTION: workflow_dispatch to UniqLearn/Platform planning-gate.yml
+# ============================================================================
+
+name: Planning Gate Dispatcher
+
+on:
+  projects_v2_item:
+    types: [edited]
+
+permissions:
+  contents: read
+
+jobs:
+  dispatch:
+    name: Dispatch Planning Gate
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check if status changed to Planning
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.PLANNING_GATE_TOKEN }}
+          PROJECT_ITEM_ID: ${{ github.event.projects_v2_item.node_id }}
+          CHANGES: ${{ toJson(github.event.changes) }}
+        run: |
+          echo "Project item changed: $PROJECT_ITEM_ID"
+          echo "Changes: $CHANGES"
+
+          # Check if the Status field was the one that changed
+          FIELD_ID=$(echo '${{ toJson(github.event.changes) }}' | jq -r '.field_value.field_node_id // empty')
+          if [ -z "$FIELD_ID" ]; then
+            echo "No field value change detected — skipping."
+            echo "should_dispatch=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Query the project item to get: issue number, repo, type, and current status
+          ITEM_DATA=$(gh api graphql -f query='
+            query($nodeId: ID!) {
+              node(id: $nodeId) {
+                ... on ProjectV2Item {
+                  fieldValueByName(name: "Status") {
+                    ... on ProjectV2ItemFieldSingleSelectValue { name }
+                  }
+                  content {
+                    ... on Issue {
+                      number
+                      repository { name owner { login } }
+                      issueType { name }
+                    }
+                  }
+                }
+              }
+            }' -f nodeId="$PROJECT_ITEM_ID")
+
+          echo "Item data: $ITEM_DATA"
+
+          STATUS=$(echo "$ITEM_DATA" | jq -r '.data.node.fieldValueByName.name // empty')
+          ISSUE_TYPE=$(echo "$ITEM_DATA" | jq -r '.data.node.content.issueType.name // empty')
+          ISSUE_NUM=$(echo "$ITEM_DATA" | jq -r '.data.node.content.number // empty')
+          REPO_NAME=$(echo "$ITEM_DATA" | jq -r '.data.node.content.repository.name // empty')
+          REPO_OWNER=$(echo "$ITEM_DATA" | jq -r '.data.node.content.repository.owner.login // empty')
+
+          echo "Status: $STATUS | Type: $ISSUE_TYPE | Issue: #$ISSUE_NUM | Repo: $REPO_OWNER/$REPO_NAME"
+
+          if [ "$STATUS" != "Planning" ]; then
+            echo "Status is not 'Planning' — skipping."
+            echo "should_dispatch=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$ISSUE_TYPE" != "Feature" ]; then
+            echo "Issue type is not 'Feature' — skipping."
+            echo "should_dispatch=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$REPO_NAME" != "Platform" ]; then
+            echo "Issue is not in Platform repo — skipping."
+            echo "should_dispatch=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Conditions met: Feature #$ISSUE_NUM moved to Planning."
+          echo "should_dispatch=true" >> "$GITHUB_OUTPUT"
+          echo "issue_number=$ISSUE_NUM" >> "$GITHUB_OUTPUT"
+          echo "repo=$REPO_OWNER/$REPO_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Dispatch planning gate workflow
+        if: steps.check.outputs.should_dispatch == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.PLANNING_GATE_TOKEN }}
+        run: |
+          echo "Dispatching planning-gate to ${{ steps.check.outputs.repo }} for issue #${{ steps.check.outputs.issue_number }}..."
+          gh workflow run planning-gate.yml \
+            --repo "${{ steps.check.outputs.repo }}" \
+            --field issue_number="${{ steps.check.outputs.issue_number }}"
+          echo "Dispatched successfully."
