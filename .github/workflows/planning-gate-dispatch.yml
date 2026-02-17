@@ -1,20 +1,33 @@
 # ============================================================================
 # Planning Gate Dispatcher — Org-level workflow
 #
-# Listens to projects_v2_item events (project board status changes).
-# When a Feature issue moves to "Planning" status, dispatches the
+# Polls the org project board every 5 minutes. When a Feature issue is in
+# "Planning" status and hasn't been processed yet, dispatches the
 # planning-gate workflow in the Platform repo.
 #
-# TRIGGER: projects_v2_item edited (field value change)
-# CONDITION: Issue type = "Feature" AND new Status = "Planning"
-# ACTION: workflow_dispatch to UniqLearn/Platform planning-gate.yml
+# WHY POLLING: The projects_v2_item webhook event is NOT a supported
+# GitHub Actions trigger (it's webhook-only, not listed in the Actions
+# "Events that trigger workflows" docs). Schedule polling is the reliable
+# alternative.
+#
+# DEDUP: Uses a 'planning-gate-dispatched' label on the issue to prevent
+# re-dispatching on subsequent polls.
+#
+# MANUAL: Can also be triggered via workflow_dispatch for testing.
 # ============================================================================
 
 name: Planning Gate Dispatcher
 
 on:
-  projects_v2_item:
-    types: [edited]
+  schedule:
+    # Every 5 minutes
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: "Specific issue number to dispatch (skips project board scan)"
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -25,83 +38,92 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Check if status changed to Planning
-        id: check
+      - name: Dispatch for specific issue (manual trigger)
+        if: inputs.issue_number != ''
         env:
           GH_TOKEN: ${{ secrets.PLANNING_GATE_TOKEN }}
-          PROJECT_ITEM_ID: ${{ github.event.projects_v2_item.node_id }}
-          CHANGES: ${{ toJson(github.event.changes) }}
         run: |
-          echo "Project item changed: $PROJECT_ITEM_ID"
-          echo "Changes: $CHANGES"
+          ISSUE_NUM="${{ inputs.issue_number }}"
+          echo "Manual dispatch for issue #$ISSUE_NUM"
 
-          # Check if the Status field was the one that changed
-          FIELD_ID=$(echo '${{ toJson(github.event.changes) }}' | jq -r '.field_value.field_node_id // empty')
-          if [ -z "$FIELD_ID" ]; then
-            echo "No field value change detected — skipping."
-            echo "should_dispatch=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+          gh workflow run planning-gate.yml \
+            --repo "UniqLearn/Platform" \
+            --field issue_number="$ISSUE_NUM"
+          echo "Dispatched planning-gate for issue #$ISSUE_NUM"
 
-          # Query the project item to get: issue number, repo, type, and current status
-          ITEM_DATA=$(gh api graphql -f query='
-            query($nodeId: ID!) {
-              node(id: $nodeId) {
-                ... on ProjectV2Item {
-                  fieldValueByName(name: "Status") {
-                    ... on ProjectV2ItemFieldSingleSelectValue { name }
-                  }
-                  content {
-                    ... on Issue {
-                      number
-                      repository { name owner { login } }
-                      issueType { name }
+      - name: Scan project board for Planning items
+        if: inputs.issue_number == ''
+        env:
+          GH_TOKEN: ${{ secrets.PLANNING_GATE_TOKEN }}
+        run: |
+          echo "Scanning project board for Feature issues in Planning status..."
+
+          # Query project #11 for items with Status = Planning
+          ITEMS=$(gh api graphql -f query='
+            query {
+              organization(login: "UniqLearn") {
+                projectV2(number: 11) {
+                  items(first: 50) {
+                    nodes {
+                      fieldValueByName(name: "Status") {
+                        ... on ProjectV2ItemFieldSingleSelectValue { name }
+                      }
+                      content {
+                        ... on Issue {
+                          number
+                          repository { name owner { login } }
+                          issueType { name }
+                          labels(first: 20) {
+                            nodes { name }
+                          }
+                        }
+                      }
                     }
                   }
                 }
               }
-            }' -f nodeId="$PROJECT_ITEM_ID")
+            }')
 
-          echo "Item data: $ITEM_DATA"
+          echo "Query complete. Filtering for Planning + Feature + Platform..."
 
-          STATUS=$(echo "$ITEM_DATA" | jq -r '.data.node.fieldValueByName.name // empty')
-          ISSUE_TYPE=$(echo "$ITEM_DATA" | jq -r '.data.node.content.issueType.name // empty')
-          ISSUE_NUM=$(echo "$ITEM_DATA" | jq -r '.data.node.content.number // empty')
-          REPO_NAME=$(echo "$ITEM_DATA" | jq -r '.data.node.content.repository.name // empty')
-          REPO_OWNER=$(echo "$ITEM_DATA" | jq -r '.data.node.content.repository.owner.login // empty')
+          # Parse and filter items
+          echo "$ITEMS" | jq -r '
+            .data.organization.projectV2.items.nodes[]
+            | select(
+                .fieldValueByName.name == "Planning"
+                and .content.issueType.name == "Feature"
+                and .content.repository.name == "Platform"
+                and .content.repository.owner.login == "UniqLearn"
+                and ([.content.labels.nodes[].name] | index("planning-gate-dispatched") | not)
+              )
+            | .content.number
+          ' | while read -r ISSUE_NUM; do
+            if [ -z "$ISSUE_NUM" ]; then
+              continue
+            fi
 
-          echo "Status: $STATUS | Type: $ISSUE_TYPE | Issue: #$ISSUE_NUM | Repo: $REPO_OWNER/$REPO_NAME"
+            echo "Found unprocessed Planning item: issue #$ISSUE_NUM"
 
-          if [ "$STATUS" != "Planning" ]; then
-            echo "Status is not 'Planning' — skipping."
-            echo "should_dispatch=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+            # Dispatch planning-gate workflow
+            echo "Dispatching planning-gate for #$ISSUE_NUM..."
+            gh workflow run planning-gate.yml \
+              --repo "UniqLearn/Platform" \
+              --field issue_number="$ISSUE_NUM"
 
-          if [ "$ISSUE_TYPE" != "Feature" ]; then
-            echo "Issue type is not 'Feature' — skipping."
-            echo "should_dispatch=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+            # Add dedup label so we don't re-dispatch next poll
+            echo "Adding planning-gate-dispatched label to #$ISSUE_NUM..."
+            gh api repos/UniqLearn/Platform/labels \
+              --method POST \
+              --field name="planning-gate-dispatched" \
+              --field color="c5def5" \
+              --field description="Planning gate has been dispatched for this issue" \
+              2>/dev/null || true
 
-          if [ "$REPO_NAME" != "Platform" ]; then
-            echo "Issue is not in Platform repo — skipping."
-            echo "should_dispatch=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+            gh issue edit "$ISSUE_NUM" \
+              --repo "UniqLearn/Platform" \
+              --add-label "planning-gate-dispatched"
 
-          echo "Conditions met: Feature #$ISSUE_NUM moved to Planning."
-          echo "should_dispatch=true" >> "$GITHUB_OUTPUT"
-          echo "issue_number=$ISSUE_NUM" >> "$GITHUB_OUTPUT"
-          echo "repo=$REPO_OWNER/$REPO_NAME" >> "$GITHUB_OUTPUT"
+            echo "Done with #$ISSUE_NUM"
+          done
 
-      - name: Dispatch planning gate workflow
-        if: steps.check.outputs.should_dispatch == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.PLANNING_GATE_TOKEN }}
-        run: |
-          echo "Dispatching planning-gate to ${{ steps.check.outputs.repo }} for issue #${{ steps.check.outputs.issue_number }}..."
-          gh workflow run planning-gate.yml \
-            --repo "${{ steps.check.outputs.repo }}" \
-            --field issue_number="${{ steps.check.outputs.issue_number }}"
-          echo "Dispatched successfully."
+          echo "Scan complete."
